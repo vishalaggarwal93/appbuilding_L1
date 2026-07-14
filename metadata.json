@@ -1,0 +1,6 @@
+{
+  "name": "Retail Sales Intelligence Dashboard",
+  "description": "An interactive sales performance intelligence dashboard with key retail metrics, Excel upload data parsing, filters, dynamic charts, and automated business insights powered by Gemini AI.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
