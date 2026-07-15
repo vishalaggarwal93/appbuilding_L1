@@ -3,11 +3,298 @@ import path from "path";
 import { createServer as createViteServer } from "vite";
 import { GoogleGenAI, Type } from "@google/genai";
 import dotenv from "dotenv";
+import { spawn, execSync } from "child_process";
+import http from "http";
+import multer from "multer";
+import * as XLSX from "xlsx";
+import { SAMPLE_SALES_DATA, enrichRecord } from "./src/sampleData";
 
 dotenv.config();
 
 const app = express();
 const PORT = 3000;
+
+let usePython = true;
+
+// Proxy all /api/python/* requests directly to Python Flask server on port 5001 if available
+app.all("/api/python/*", (req, res, next) => {
+  if (!usePython) {
+    return next();
+  }
+
+  const options = {
+    hostname: "127.0.0.1",
+    port: 5001,
+    path: req.originalUrl,
+    method: req.method,
+    headers: req.headers,
+  };
+
+  const proxyReq = http.request(options, (proxyRes) => {
+    res.writeHead(proxyRes.statusCode || 200, proxyRes.headers);
+    proxyRes.pipe(res);
+  });
+
+  proxyReq.on("error", (err) => {
+    console.error("Python proxy connection error (falling back to Node.js backend):", err);
+    usePython = false;
+    if (req.method === "GET") {
+      return next();
+    } else {
+      res.status(502).json({
+        error: "Python backend offline",
+        message: "The Python Excel API server is currently initializing or offline. Please retry.",
+      });
+    }
+  });
+
+  req.pipe(proxyReq);
+});
+
+// Start the Python Excel Backend Process safely only if python3 is available
+let pythonBackend: any = null;
+
+try {
+  // Synchronously check if python3 exists on the system to prevent uncaught spawn ENOENT crashes
+  execSync("python3 --version", { stdio: "ignore" });
+} catch (e) {
+  console.warn("[Node Server]: python3 command is not available on this operating system. Falling back to Node.js parser.");
+  usePython = false;
+}
+
+if (usePython) {
+  try {
+    pythonBackend = spawn("python3", ["excel_backend.py"]);
+
+    pythonBackend.on("error", (err: any) => {
+      console.warn("[Node Server]: Failed to spawn Python backend process. Operating with Node.js parser instead.");
+      usePython = false;
+    });
+
+    pythonBackend.on("exit", (code: number | null) => {
+      if (code !== 0 && code !== null) {
+        console.warn(`[Node Server]: Python process exited with code ${code}. Operating with Node.js parser instead.`);
+        usePython = false;
+      }
+    });
+
+    pythonBackend.stdout.on("data", (data: any) => {
+      console.log(`[Python Stdout]: ${data}`);
+    });
+
+    pythonBackend.stderr.on("data", (data: any) => {
+      console.error(`[Python Stderr]: ${data}`);
+    });
+  } catch (err) {
+    console.warn("[Node Server]: Error during spawning python3:", err);
+    usePython = false;
+  }
+}
+
+process.on("exit", () => {
+  if (pythonBackend) {
+    pythonBackend.kill();
+  }
+});
+
+// Node.js fallback implementation for Python API routes (runs if Python is missing/fails to spawn)
+app.get("/api/python/initial-data", (req, res) => {
+  res.json({
+    status: "success",
+    records: SAMPLE_SALES_DATA
+  });
+});
+
+const upload = multer({ storage: multer.memoryStorage() });
+
+app.post("/api/python/parse", upload.single("file"), (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({ error: "No file selected" });
+    }
+
+    const workbook = XLSX.read(req.file.buffer, { type: "buffer" });
+    const firstSheetName = workbook.SheetNames[0];
+    const worksheet = workbook.Sheets[firstSheetName];
+    
+    // Parse as raw rows (array of arrays)
+    const rawRows = XLSX.utils.sheet_to_json<any[]>(worksheet, { header: 1 });
+
+    if (!rawRows || rawRows.length < 2) {
+      return res.json({
+        status: "success",
+        filename: req.file.originalname,
+        records: []
+      });
+    }
+
+    const headers = rawRows[0].map((h: any) => h !== undefined && h !== null ? String(h).trim() : "");
+    const dataRows = rawRows.slice(1);
+    
+    const cleanHeader = (h: string) => h.toLowerCase().replace(/[^a-z0-9]/g, "");
+    
+    const matchHeader = (includes: string[], excludes: string[] = []): number => {
+      for (let idx = 0; idx < headers.length; idx++) {
+        const ch = cleanHeader(headers[idx]);
+        const hasInclude = includes.some(inc => ch.includes(inc));
+        const hasExclude = excludes.some(exc => ch.includes(exc));
+        if (hasInclude && !hasExclude) {
+          return idx;
+        }
+      }
+      return -1;
+    };
+
+    const dateIdx = matchHeader(["date", "time", "day", "orderdate", "transdate"], ["update", "birth"]);
+    const categoryIdx = matchHeader(["category", "dept", "department", "group"]);
+    const productIdx = matchHeader(["product", "item", "sku", "desc", "description", "name"], ["store", "customer", "client", "brand", "vendor", "buyer", "user", "city", "format", "region"]);
+    const salesIdx = matchHeader(["sales", "revenue", "amount", "total", "price", "sale"], ["target", "goal", "budget", "forecast", "return", "refund", "discount", "markdown", "profit", "margin", "cost", "tax", "qty", "quantity", "id"]);
+    const qtyIdx = matchHeader(["qty", "quantity", "units", "count", "volume"], ["price", "amount", "sales", "id"]);
+    const profitIdx = matchHeader(["profit", "margin", "earnings", "net", "income"], ["gross", "sales", "revenue", "target"]);
+    const regionIdx = matchHeader(["region", "zone", "state", "country"], ["city", "store", "format", "town"]);
+    const segmentIdx = matchHeader(["segment", "customer", "type", "audience", "channel"]);
+    const returnIdx = matchHeader(["returnamount", "return", "returns", "refund", "refunds"], ["rate", "pct", "percent"]);
+    const discountIdx = matchHeader(["discountamount", "discount", "markdown", "discounts", "markdowns"], ["rate", "pct", "percent"]);
+    const targetIdx = matchHeader(["targetsales", "target", "targets", "goal", "goals", "budget"], ["achievement", "rate", "pct", "percent"]);
+    const storeIdx = matchHeader(["store", "storename", "outlet", "outletname"], ["id", "code", "num", "no", "key", "format", "city", "region"]);
+    const storeid_idx = matchHeader(["storeid", "storecode", "storenum", "outletid", "storeno"]);
+    const city_idx = matchHeader(["city", "town", "citylocation"]);
+    const format_idx = matchHeader(["storeformat", "format"]);
+    const week_idx = matchHeader(["week", "wk", "weekly"], ["orderdate", "transdate", "salesdate"]);
+    const stock_idx = matchHeader(["stocklevel", "inventory", "stock", "qtyonhand"], ["sold", "out", "risk"]);
+
+    const records: any[] = [];
+
+    for (let index = 0; index < dataRows.length; index++) {
+      const r = dataRows[index];
+      if (!r || r.every((cell: any) => cell === undefined || cell === null || String(cell).trim() === "")) {
+        continue;
+      }
+
+      const getVal = (idx: number, defaultVal: any = undefined) => {
+        if (idx !== -1 && idx < r.length && r[idx] !== undefined && r[idx] !== null) {
+          return r[idx];
+        }
+        return defaultVal;
+      };
+
+      const product = String(getVal(productIdx, "Product Item")).trim();
+      if (!product || ["product item", "product"].includes(product.toLowerCase())) {
+        continue;
+      }
+
+      const rawDate = getVal(dateIdx, "2026-01-01");
+      let dateStr = "2026-01-01";
+      if (typeof rawDate === "number") {
+        try {
+          const parsedDate = XLSX.SSF.parse_date_code(rawDate);
+          const pad = (n: number) => String(n).padStart(2, "0");
+          dateStr = `${parsedDate.y}-${pad(parsedDate.m)}-${pad(parsedDate.d)}`;
+        } catch {
+          dateStr = "2026-01-01";
+        }
+      } else if (rawDate) {
+        const rawDateStr = String(rawDate).trim();
+        const splitDate = rawDateStr.split("T")[0];
+        const dateObj = new Date(splitDate);
+        if (!isNaN(dateObj.getTime())) {
+          const pad = (n: number) => String(n).padStart(2, "0");
+          dateStr = `${dateObj.getFullYear()}-${pad(dateObj.getMonth() + 1)}-${pad(dateObj.getDate())}`;
+        }
+      }
+
+      const category = String(getVal(categoryIdx, "General"));
+      const rawSales = getVal(salesIdx, 0);
+      let sales = 0;
+      if (typeof rawSales === "number") {
+        sales = rawSales;
+      } else {
+        sales = parseFloat(String(rawSales).replace(/[^0-9.-]/g, "")) || 0;
+      }
+
+      const rawQty = getVal(qtyIdx, 1);
+      let quantity = 1;
+      if (typeof rawQty === "number") {
+        quantity = rawQty;
+      } else {
+        quantity = parseInt(String(rawQty).replace(/[^0-9-]/g, "")) || 1;
+      }
+
+      const rawProfit = getVal(profitIdx, null);
+      let profit = sales * 0.35;
+      if (rawProfit !== null) {
+        if (typeof rawProfit === "number") {
+          profit = rawProfit;
+        } else {
+          profit = parseFloat(String(rawProfit).replace(/[^0-9.-]/g, "")) || 0;
+        }
+        if (profit > 0 && profit < 1.0) {
+          profit = sales * profit;
+        }
+      }
+
+      const region = String(getVal(regionIdx, "East"));
+      const segment = String(getVal(segmentIdx, "Consumer"));
+
+      const returnAmount = getVal(returnIdx, null);
+      const discountAmount = getVal(discountIdx, null);
+      const targetSales = getVal(targetIdx, null);
+      const store = getVal(storeIdx, null);
+      const storeId = getVal(storeid_idx, null);
+      const city = getVal(city_idx, null);
+      const storeFormat = getVal(format_idx, null);
+      const stockLevel = getVal(stock_idx, null);
+
+      const rawWeek = getVal(week_idx, null);
+      let week: string | undefined = undefined;
+      if (rawWeek !== null) {
+        if (typeof rawWeek === "number" && rawWeek > 100) {
+          try {
+            const parsedDate = XLSX.SSF.parse_date_code(rawWeek);
+            const pad = (n: number) => String(n).padStart(2, "0");
+            week = `${pad(parsedDate.d)}-${pad(parsedDate.m)}-${parsedDate.y}`;
+          } catch {
+            week = String(rawWeek);
+          }
+        } else {
+          week = String(rawWeek).trim();
+        }
+      }
+
+      const rawRecord = {
+        id: `uploaded-${index}-${Date.now()}`,
+        date: dateStr,
+        category,
+        product,
+        sales,
+        quantity,
+        profit,
+        region,
+        segment,
+        returnAmount,
+        discountAmount,
+        targetSales,
+        store,
+        storeId,
+        city,
+        storeFormat,
+        week,
+        stockLevel
+      };
+
+      records.push(enrichRecord(rawRecord, index));
+    }
+
+    res.json({
+      status: "success",
+      filename: req.file.originalname,
+      records
+    });
+  } catch (error: any) {
+    console.error("Error parsing Excel in Node fallback:", error);
+    res.status(500).json({ status: "error", message: error.message });
+  }
+});
 
 app.use(express.json({ limit: "50mb" }));
 

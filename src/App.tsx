@@ -1,4 +1,4 @@
-import React, { useState, useMemo } from "react";
+import React, { useState, useMemo, useEffect } from "react";
 import { SAMPLE_SALES_DATA } from "./sampleData";
 import { SalesRecord, DashboardFilters } from "./types";
 import { calculateMetrics } from "./utils/metrics";
@@ -18,13 +18,32 @@ export default function App() {
     records: SalesRecord[];
   }[]>([]);
 
-  // Compute primary raw dataset dynamically: merge spreadsheets if loaded, else fallback to standard sample
+  const [pythonInitialRecords, setPythonInitialRecords] = useState<SalesRecord[]>([]);
+
+  // Fetch initial seed dataset from Python Excel backend on mount
+  useEffect(() => {
+    fetch("/api/python/initial-data")
+      .then((res) => {
+        if (!res.ok) throw new Error("HTTP error " + res.status);
+        return res.json();
+      })
+      .then((data) => {
+        if (data.status === "success" && Array.isArray(data.records)) {
+          setPythonInitialRecords(data.records);
+        }
+      })
+      .catch((err) => {
+        console.error("Error fetching initial records from Python backend:", err);
+      });
+  }, []);
+
+  // Compute primary raw dataset dynamically: merge spreadsheets if loaded, else fallback to standard sample or python-parsed data
   const salesRecords = useMemo(() => {
     if (uploadedFiles.length === 0) {
-      return SAMPLE_SALES_DATA;
+      return pythonInitialRecords.length > 0 ? pythonInitialRecords : SAMPLE_SALES_DATA;
     }
     return uploadedFiles.flatMap((f) => f.records);
-  }, [uploadedFiles]);
+  }, [uploadedFiles, pythonInitialRecords]);
 
   // Active dashboard filter states
   const [filters, setFilters] = useState<DashboardFilters>({
