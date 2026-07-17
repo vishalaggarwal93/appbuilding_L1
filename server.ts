@@ -14,82 +14,16 @@ dotenv.config();
 const app = express();
 const PORT = 3000;
 
-let usePython = true;
+let usePython = false;
 
-// Proxy all /api/python/* requests directly to Python Flask server on port 5001 if available
+// Fall through directly to native Node.js route handlers
 app.all("/api/python/*", (req, res, next) => {
-  if (!usePython) {
-    return next();
-  }
-
-  const options = {
-    hostname: "127.0.0.1",
-    port: 5001,
-    path: req.originalUrl,
-    method: req.method,
-    headers: req.headers,
-  };
-
-  const proxyReq = http.request(options, (proxyRes) => {
-    res.writeHead(proxyRes.statusCode || 200, proxyRes.headers);
-    proxyRes.pipe(res);
-  });
-
-  proxyReq.on("error", (err) => {
-    console.error("Python proxy connection error (falling back to Node.js backend):", err);
-    usePython = false;
-    if (req.method === "GET") {
-      return next();
-    } else {
-      res.status(502).json({
-        error: "Python backend offline",
-        message: "The Python Excel API server is currently initializing or offline. Please retry.",
-      });
-    }
-  });
-
-  req.pipe(proxyReq);
+  return next();
 });
 
-// Start the Python Excel Backend Process safely only if python3 is available
+// Disabled Python Backend Process to use the extremely robust Node.js XLSX/CSV parser instead
 let pythonBackend: any = null;
 
-try {
-  // Synchronously check if python3 exists on the system to prevent uncaught spawn ENOENT crashes
-  execSync("python3 --version", { stdio: "ignore" });
-} catch (e) {
-  console.warn("[Node Server]: python3 command is not available on this operating system. Falling back to Node.js parser.");
-  usePython = false;
-}
-
-if (usePython) {
-  try {
-    pythonBackend = spawn("python3", ["excel_backend.py"]);
-
-    pythonBackend.on("error", (err: any) => {
-      console.warn("[Node Server]: Failed to spawn Python backend process. Operating with Node.js parser instead.");
-      usePython = false;
-    });
-
-    pythonBackend.on("exit", (code: number | null) => {
-      if (code !== 0 && code !== null) {
-        console.warn(`[Node Server]: Python process exited with code ${code}. Operating with Node.js parser instead.`);
-        usePython = false;
-      }
-    });
-
-    pythonBackend.stdout.on("data", (data: any) => {
-      console.log(`[Python Stdout]: ${data}`);
-    });
-
-    pythonBackend.stderr.on("data", (data: any) => {
-      console.error(`[Python Stderr]: ${data}`);
-    });
-  } catch (err) {
-    console.warn("[Node Server]: Error during spawning python3:", err);
-    usePython = false;
-  }
-}
 
 process.on("exit", () => {
   if (pythonBackend) {
